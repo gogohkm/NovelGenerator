@@ -13,7 +13,7 @@ from .generation_loop import (
     SceneGenerator,
     StaticBranchOptionGenerator,
 )
-from .models import ActType, ConsistencyIssue, SceneCard, StoryProject
+from .models import ActType, ConsistencyIssue, SceneCard, StoryProject, CharacterProfile
 
 
 class RuleBasedMockGenerator(SceneGenerator):
@@ -132,7 +132,18 @@ class LMStudioOpenAICompatibleGenerator(SceneGenerator):
                 )
             parts.append("\n[등장인물 현재 상태]\n" + "\n".join(char_lines))
 
-        # 4) 막별 요약 — 전체 흐름 파악용
+        # 3.5) 캐릭터 장기 설정 (프로필)
+        if project.characters:
+            prof_lines = []
+            for cid, cp in project.characters.items():
+                is_pov = (cid == scene.pov_character_id or cp.name == scene.pov_character_id)
+                prefix = "[현재 씬의 시점(POV) 주인공] " if is_pov else ""
+                prof_lines.append(
+                    f"  - {prefix}{cp.name} ({cp.role}):\n"
+                    f"      성격: {cp.personality}\n"
+                    f"      과거: {cp.background}"
+                )
+            parts.append("\n[등장인물 설정 (인물 간 성격 및 언행 일치용)]\n" + "\n".join(prof_lines))
         act_labels = {
             ActType.RISE: "기(起)", ActType.DEVELOPMENT: "승(承)",
             ActType.TURN: "전(轉)", ActType.CONCLUSION: "결(結)",
@@ -147,8 +158,9 @@ class LMStudioOpenAICompatibleGenerator(SceneGenerator):
                 parts.append("\n[막별 누적 요약]\n" + "\n".join(summary_lines))
 
         # 5) 같은 막의 기존 장면 요약 — 막 내 흐름 연속성
+        # 5) 같은 막의 기존 장면 요약 — 막 내 흐름 연속성 (독립 장면이면 생략)
         same_act_ids = project.acts.get(scene.act, [])
-        if same_act_ids:
+        if same_act_ids and scene.context_mode != "standalone":
             same_act_lines = []
             for sid in same_act_ids[-5:]:  # 최근 5개
                 s = project.scenes.get(sid)
@@ -161,15 +173,16 @@ class LMStudioOpenAICompatibleGenerator(SceneGenerator):
                 )
 
         # 6) 최근 장면 본문/요약 — 직전 장면과의 직접 연결
+        # 6) 최근 장면 본문/요약 (독립 장면이면 생략)
         recent_ids = mem.recent_scene_window[-3:]
-        if recent_ids:
+        if recent_ids and scene.context_mode != "standalone":
             recent_parts = []
             for sid in recent_ids:
                 s = project.scenes.get(sid)
                 if not s:
                     continue
-                # 가장 마지막 장면은 본문 일부 포함, 나머지는 요약만
-                if sid == recent_ids[-1] and s.full_text:
+                # contiguous일 때만 직전 텍스트 끝부분 복붙. new_chapter면 요약만 전달.
+                if sid == recent_ids[-1] and s.full_text and scene.context_mode == "contiguous":
                     text_snippet = s.full_text[-800:]  # 마지막 800자
                     recent_parts.append(
                         f"  [{sid} (막: {act_labels.get(s.act, s.act.value)}) — 직전 장면 본문 끝부분]\n"
@@ -208,16 +221,24 @@ class LMStudioOpenAICompatibleGenerator(SceneGenerator):
             f"결과(유도): {scene.outcome}"
         )
 
-        # 9) 요구사항
-        parts.append(
-            "\n[요구사항]\n"
-            "- 900~1400자 내외\n"
-            "- 이전 장면의 결말과 자연스럽게 연결될 것\n"
-            "- 이후 장면(이미 작성된 경우)으로 이어질 복선을 포함할 것\n"
-            "- 확정된 사실(스토리 바이블)과 모순되지 않을 것\n"
-            "- 다음 장면으로 이어질 떡밥 1개 포함\n"
-            "- 세계관 규칙을 위반하지 않을 것"
-        )
+        reqs = [
+            "- 900~1400자 내외",
+            "- 확정된 사실(스토리 바이블)과 모순되지 않을 것",
+            "- 세계관 규칙을 위반하지 않을 것",
+        ]
+        
+        if scene.context_mode == "standalone":
+            reqs.append("- 이전 씬들과의 직접적 연결 없이 완전히 독립된 맥락(도입부, 막간, 특수 시점 등)으로 서술할 것")
+            reqs.append("- 세계관만 공유하되 분위기나 전개를 새롭게 시작할 것")
+        elif scene.context_mode == "new_chapter":
+            reqs.append("- 직전 장면의 줄거리 흐름을 이어가되, 시간이나 공간을 뛰어넘어 새로운 챕터를 시작하듯 쓸 것")
+            reqs.append("- 직전 장면의 마지막 대사나 행동으로 바로 이어쓰지 말 것")
+        else:
+            reqs.append("- 이전 장면의 결말 부분에서 문자 그대로 자연스럽게 이어쓸 것")
+            reqs.append("- 다음 장면으로 이어질 떡밥을 최소 1개 포함할 것")
+            reqs.append("- 이후 막/장면(이미 작성된 경우)을 위한 복선을 염두에 둘 것")
+
+        parts.append("\n[요구사항]\n" + "\n".join(reqs))
 
         return "\n".join(parts)
 
@@ -386,3 +407,62 @@ class LLMUnifyHelper:
             )
         except Exception:
             return RuleCheckResult(violated=False, confidence=0.0, explanation="LLM 시간순 검사 실패")
+
+
+class LLMCharacterHelper:
+    """LLM을 활용해 캐릭터 성격/과거를 자동 설정하고 씬에서 새 인물을 추출한다."""
+
+    def __init__(self, client: LMStudioClient):
+        self.client = client
+
+    def generate_initial_profile(self, project: StoryProject, name: str, role: str) -> dict:
+        system = (
+            "당신은 소설 캐릭터 설정가다. 주어진 이름과 역할, 세계관을 바탕으로 어울리는 성격과 과거 배경을 창작하라. "
+            '반드시 아래 JSON 형식으로만 응답하라:\n'
+            '{"personality": "...", "background": "..."}'
+        )
+        user = (
+            f"세계관 장르: {project.genre}, 톤: {project.tone}\n"
+            f"세계관 규칙: {', '.join(project.world_rules)}\n\n"
+            f"이름: {name}\n"
+            f"역할: {role}\n\n"
+            "이 캐릭터한테 자연스럽고 입체적인 성격과 극적인 과거를 2~3문장씩 작성하라."
+        )
+        try:
+            raw = self.client.chat_completion(system=system, user=user, temperature=0.8)
+            json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                return {
+                    "personality": str(data.get("personality", "")).strip(),
+                    "background": str(data.get("background", "")).strip(),
+                }
+        except Exception:
+            pass
+        return {"personality": "알 수 없는 성격", "background": "비밀에 싸인 과거"}
+
+    def extract_new_characters(self, project: StoryProject, scene_text: str) -> list[dict]:
+        existing_names = [p.name for p in project.characters.values()]
+        
+        system = (
+            "당신은 소설 데이터 추출기다. 주어진 장면 텍스트를 읽고, 기존에 등록되지 않은 새롭고 비중있는 등장인물의 이름, 역할, 성격을 추출하라. "
+            '스쳐 지나가는 단역은 제외하라. '
+            '반드시 아래 JSON 배열 형식으로만 응답하라:\n'
+            '[{"name": "...", "role": "...", "personality": "...", "background": "장면에서 추론되거나 발견된 과거 (없으면 미상)"}]'
+        )
+        user = (
+            f"기존 등록된 인물들: {', '.join(existing_names) if existing_names else '없음'}\n\n"
+            f"장면 텍스트:\n{scene_text}\n\n"
+            "위 장면에서 완전히 새롭게 등장한 중요한 인물들을 배열로 추출하라. 새 인물이 없으면 빈 배열 [] 을 반환하라."
+        )
+        try:
+            raw = self.client.chat_completion(system=system, user=user, temperature=0.3)
+            json_match = re.search(r"\[.*\]", raw, re.DOTALL)
+            if json_match:
+                items = json.loads(json_match.group())
+                if isinstance(items, list):
+                    return items
+        except Exception:
+            pass
+        return []
+

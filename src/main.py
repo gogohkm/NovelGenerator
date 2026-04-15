@@ -36,6 +36,14 @@ def build_sample_project() -> StoryProject:
         required_facts={"alliance_formed": "true"},
         theme_alignment_hint="협력과 책임",
     )
+    from core.models import CharacterProfile
+    project.characters["protagonist"] = CharacterProfile(
+        character_id="protagonist",
+        name="주인공",
+        role="주인공",
+        personality="정의롭고 결단력 있음",
+        background="과거의 상처를 안고 미래를 개척하고자 함"
+    )
     return project
 
 

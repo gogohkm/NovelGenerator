@@ -28,6 +28,15 @@ class CharacterState:
 
 
 @dataclass
+class CharacterProfile:
+    character_id: str
+    name: str # display name
+    role: str # 주인공, 조력자, 빌런 등
+    personality: str
+    background: str
+
+
+@dataclass
 class StoryFact:
     key: str
     value: str
@@ -50,6 +59,7 @@ class SceneCard:
     full_text: Optional[str] = None
     reachable_endings: List[str] = field(default_factory=list)
     user_modified: bool = False
+    context_mode: str = "contiguous"
     order_index: int = 0
 
 
@@ -98,6 +108,7 @@ class StoryProject:
     style_preset: str
     world_rules: List[str] = field(default_factory=list)
     hard_constraints: List[str] = field(default_factory=list)
+    characters: Dict[str, CharacterProfile] = field(default_factory=dict)
     acts: Dict[ActType, List[str]] = field(default_factory=dict)
     branches: Dict[str, BranchNode] = field(default_factory=dict)
     scenes: Dict[str, SceneCard] = field(default_factory=dict)

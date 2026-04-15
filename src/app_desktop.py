@@ -38,6 +38,7 @@ from core.consistency import UnifyEngine
 from core.generation_loop import BranchOptionGenerator, PlotManager, StoryEngine
 from core.llm_adapter import (
     LLMBranchOptionGenerator,
+    LLMCharacterHelper,
     LLMUnifyHelper,
     LLMWorldRuleChecker,
     LMStudioClient,
@@ -49,6 +50,7 @@ from core.llm_adapter import (
 from core.models import (
     ActType,
     BranchNode,
+    CharacterProfile,
     EndingCondition,
     SceneCard,
     StoryProject,
@@ -100,6 +102,13 @@ def build_default_project() -> StoryProject:
     project.branches[root.branch_id] = root
     project.acts = {act: [] for act in ActType}
     project.endings["ending-1"] = EndingCondition(ending_id="ending-1", title="희망의 결말")
+    project.characters["protagonist"] = CharacterProfile(
+        character_id="protagonist",
+        name="주인공",
+        role="주인공",
+        personality="정의롭고 결단력 있음",
+        background="과거의 상처를 안고 미래를 개척하고자 함"
+    )
     return project
 
 
@@ -234,18 +243,25 @@ class GenerationWorker(QThread):
     error = Signal(str)
 
     def __init__(self, engine: StoryEngine, project: StoryProject,
-                 branch_id: str, option_index: int, target_act: ActType):
+                 branch_id: str, option_index: int, target_act: ActType,
+                 custom_option: Optional[str] = None, context_mode: str = "contiguous",
+                 pov_character_id: str = "protagonist"):
         super().__init__()
         self.engine = engine
         self.project = project
         self.branch_id = branch_id
         self.option_index = option_index
         self.target_act = target_act
+        self.custom_option = custom_option
+        self.context_mode = context_mode
+        self.pov_character_id = pov_character_id
 
     def run(self) -> None:
         try:
             scene = self.engine.run_turn(
                 self.project, self.branch_id, self.option_index, target_act=self.target_act,
+                custom_option=self.custom_option, context_mode=self.context_mode,
+                pov_character_id=self.pov_character_id
             )
             self.finished.emit(scene)
         except Exception as e:
@@ -323,6 +339,42 @@ class UnifyApplyWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+
+class CharacterProfileGenerateWorker(QThread):
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, helper: 'LLMCharacterHelper', project: 'StoryProject', name: str, role: str):
+        super().__init__()
+        self.helper = helper
+        self.project = project
+        self.name = name
+        self.role = role
+
+    def run(self) -> None:
+        try:
+            profile_data = self.helper.generate_initial_profile(self.project, self.name, self.role)
+            self.finished.emit(profile_data)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class CharacterExtractWorker(QThread):
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, helper: 'LLMCharacterHelper', project: 'StoryProject', scene_text: str):
+        super().__init__()
+        self.helper = helper
+        self.project = project
+        self.scene_text = scene_text
+
+    def run(self) -> None:
+        try:
+            items = self.helper.extract_new_characters(self.project, self.scene_text)
+            self.finished.emit(items)
+        except Exception as e:
+            self.error.emit(str(e))
 
 # ─── Unify Dialog ───────────────────────────────────────────────────
 
@@ -444,8 +496,34 @@ class MainWindow(QMainWindow):
         self.style = QLineEdit(self.state.project.style_preset)
         self.world_rules = QTextEdit("\n".join(self.state.project.world_rules))
 
+        # --- Character Management ---
+        self.char_list_combo = QComboBox()
+        self.char_name = QLineEdit()
+        self.char_role = QLineEdit()
+        self.char_personality = QTextEdit()
+        self.char_background = QTextEdit()
+        self.char_personality.setMaximumHeight(60)
+        self.char_background.setMaximumHeight(60)
+        
+        self.char_save_btn = QPushButton("저장 / 추가")
+        self.char_auto_btn = QPushButton("LLM 자동 설정")
+        self.char_extract_btn = QPushButton("현재 장면에서 새 인물 추출")
+        
+        # --- Scene generation POV ---
+        self.scene_pov_combo = QComboBox()
+
         # --- Branch options ---
         self.options = QComboBox()
+        self.custom_option_input = QLineEdit()
+        self.custom_option_input.setPlaceholderText("직접 입력 시 위 추천 선택지를 무시하고 우선 적용됩니다.")
+        
+        self.context_mode_combo = QComboBox()
+        self.context_mode_combo.addItems([
+            "이어쓰기 (직전 장면과 대사/행동 바로 연결)",
+            "새 챕터/막 시작 (시간/공간 바뀌며 줄거리만 이어감)",
+            "완전 독립된 도입부/막간 (흐름 끊고 새로 시작)"
+        ])
+
         self.generate_btn = QPushButton("선택 반영 → 장면 생성")
         self.refresh_options_btn = QPushButton("선택지 새로고침")
 
@@ -519,6 +597,10 @@ class MainWindow(QMainWindow):
         self.prev_scene_btn.clicked.connect(self._go_prev_scene)
         self.next_scene_btn.clicked.connect(self._go_next_scene)
         self.delete_scene_btn.clicked.connect(self._delete_current_scene)
+        self.char_list_combo.currentIndexChanged.connect(self._on_char_selected)
+        self.char_save_btn.clicked.connect(self._save_character)
+        self.char_auto_btn.clicked.connect(self._auto_character_profile)
+        self.char_extract_btn.clicked.connect(self._extract_characters_from_scene)
 
     def _layout(self) -> None:
         root = QWidget()
@@ -558,6 +640,31 @@ class MainWindow(QMainWindow):
         proj_box.setLayout(proj_form)
         left_layout.addWidget(proj_box)
 
+        # [F] Collapsible Character settings
+        char_box = CollapsibleGroupBox("등장인물 관리", collapsed=True)
+        char_form = QVBoxLayout(char_box)
+        
+        char_dropdown_row = QHBoxLayout()
+        char_dropdown_row.addWidget(QLabel("선택:"))
+        char_dropdown_row.addWidget(self.char_list_combo, 1)
+        char_form.addLayout(char_dropdown_row)
+        
+        c_form = QFormLayout()
+        c_form.addRow("이름", self.char_name)
+        c_form.addRow("역할", self.char_role)
+        c_form.addRow("성격", self.char_personality)
+        c_form.addRow("과거", self.char_background)
+        char_form.addLayout(c_form)
+        
+        char_btn_row = QHBoxLayout()
+        char_btn_row.addWidget(self.char_save_btn)
+        char_btn_row.addWidget(self.char_auto_btn)
+        char_form.addLayout(char_btn_row)
+        
+        char_form.addWidget(self.char_extract_btn)
+        
+        left_layout.addWidget(char_box)
+        
         actions = QHBoxLayout()
         actions.addWidget(self.new_project_btn)
         actions.addWidget(self.save_btn)
@@ -565,10 +672,21 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.unify_btn)
         left_layout.addLayout(actions)
 
-        branch_box = QGroupBox("분기 선택")
+        branch_box = QGroupBox("분기 선택 및 생성")
         branch_layout = QVBoxLayout(branch_box)
         branch_layout.addWidget(self.current_branch_label)
+        
+        branch_pov_row = QHBoxLayout()
+        branch_pov_row.addWidget(QLabel("시점 인물(POV):"))
+        branch_pov_row.addWidget(self.scene_pov_combo, 1)
+        branch_layout.addLayout(branch_pov_row)
+        
+        branch_layout.addWidget(QLabel("LLM 추천 선택지:"))
         branch_layout.addWidget(self.options)
+        branch_layout.addWidget(QLabel("직접 입력 (우선 적용):"))
+        branch_layout.addWidget(self.custom_option_input)
+        branch_layout.addWidget(QLabel("컨텍스트 모드:"))
+        branch_layout.addWidget(self.context_mode_combo)
         branch_actions = QHBoxLayout()
         branch_actions.addWidget(self.refresh_options_btn)
         branch_actions.addWidget(self.generate_btn)
@@ -778,15 +896,23 @@ class MainWindow(QMainWindow):
         try:
             self._apply_project_settings_to_model()
             idx = self.options.currentIndex()
-            if idx < 0:
-                QMessageBox.information(self, "안내", "선택지를 먼저 고르세요.")
+            custom_option_text = self.custom_option_input.text().strip()
+            
+            if idx < 0 and not custom_option_text:
+                QMessageBox.information(self, "안내", "선택지를 고르거나 직접 입력하세요.")
                 return
+
+            context_mode_idx = self.context_mode_combo.currentIndex()
+            mode_map = ["contiguous", "new_chapter", "standalone"]
+            context_mode = mode_map[context_mode_idx]
+            pov_id = self.scene_pov_combo.currentData() or "protagonist"
 
             self._set_generation_ui_enabled(False)
             target_act = self._current_target_act()
             engine = self._build_engine()
             self._worker = GenerationWorker(
-                engine, self.state.project, self.state.current_branch_id, idx, target_act,
+                engine, self.state.project, self.state.current_branch_id, max(0, idx), target_act,
+                custom_option=custom_option_text, context_mode=context_mode, pov_character_id=pov_id
             )
             self._worker.finished.connect(self._on_generation_done)
             self._worker.error.connect(self._on_generation_error)
@@ -798,6 +924,8 @@ class MainWindow(QMainWindow):
     def _on_generation_done(self, scene: SceneCard) -> None:
         self._set_generation_ui_enabled(True)
         self.state.current_branch_id = scene.branch_id
+        self.custom_option_input.clear()
+        self.context_mode_combo.setCurrentIndex(0)
         self.current_branch_label.setText(f"현재 분기: {self.state.current_branch_id}")
         self._show_scene(scene)
 
@@ -1098,8 +1226,149 @@ class MainWindow(QMainWindow):
         self.current_branch_label.setText(f"현재 분기: {self.state.current_branch_id}")
         self.current_scene_label.setText("현재 장면: (없음)")
         self.ending_status_label.setText("도달 가능 결말: (없음)")
+        self._refresh_char_list()
         self._update_nav_buttons()
         self._refresh_options()
+
+    # ─── Character Management ───
+    def _refresh_char_list(self) -> None:
+        self.char_list_combo.blockSignals(True)
+        self.scene_pov_combo.blockSignals(True)
+        
+        self.char_list_combo.clear()
+        self.scene_pov_combo.clear()
+        
+        self.char_list_combo.addItem("새 인물 추가...", "")
+        self.scene_pov_combo.addItem("기본(전지적/작품기본)", "protagonist")
+        
+        for cid, cp in self.state.project.characters.items():
+            self.char_list_combo.addItem(f"{cp.name} ({cp.role})", cid)
+            self.scene_pov_combo.addItem(f"{cp.name}", cid)
+            
+        self.char_list_combo.blockSignals(False)
+        self.scene_pov_combo.blockSignals(False)
+
+    def _on_char_selected(self) -> None:
+        cid = self.char_list_combo.currentData()
+        if not cid:
+            self.char_name.clear()
+            self.char_role.clear()
+            self.char_personality.clear()
+            self.char_background.clear()
+            return
+        
+        cp = self.state.project.characters.get(cid)
+        if cp:
+            self.char_name.setText(cp.name)
+            self.char_role.setText(cp.role)
+            self.char_personality.setPlainText(cp.personality)
+            self.char_background.setPlainText(cp.background)
+
+    def _save_character(self) -> None:
+        name = self.char_name.text().strip()
+        role = self.char_role.text().strip()
+        if not name:
+            QMessageBox.warning(self, "입력 오류", "이름을 입력하세요.")
+            return
+
+        cid = self.char_list_combo.currentData()
+        if not cid:
+            cid = f"char_{len(self.state.project.characters) + 1}_{hash(name)%1000}"
+
+        cp = CharacterProfile(
+            character_id=cid,
+            name=name,
+            role=role,
+            personality=self.char_personality.toPlainText().strip(),
+            background=self.char_background.toPlainText().strip()
+        )
+        self.state.project.characters[cid] = cp
+        self._refresh_char_list()
+        
+        idx = self.char_list_combo.findData(cid)
+        if idx >= 0:
+            self.char_list_combo.setCurrentIndex(idx)
+            
+        QMessageBox.information(self, "저장 완료", f"'{name}' 설정이 저장되었습니다.")
+
+    def _auto_character_profile(self) -> None:
+        name = self.char_name.text().strip()
+        role = self.char_role.text().strip()
+        if not name or not role:
+            QMessageBox.warning(self, "입력 오류", "이름과 역할을 먼저 입력하세요.")
+            return
+
+        client = self._build_lm_client()
+        helper = LLMCharacterHelper(client)
+        self._char_gen_worker = CharacterProfileGenerateWorker(helper, self.state.project, name, role)
+        self._char_gen_worker.finished.connect(self._on_auto_char_profile_done)
+        self._char_gen_worker.error.connect(lambda e: QMessageBox.critical(self, "오류", str(e)))
+        self.char_auto_btn.setEnabled(False)
+        self.char_auto_btn.setText("생성 중...")
+        self._char_gen_worker.start()
+
+    def _on_auto_char_profile_done(self, prof: dict) -> None:
+        self.char_auto_btn.setEnabled(True)
+        self.char_auto_btn.setText("LLM 자동 설정")
+        self.char_personality.setPlainText(prof.get("personality", ""))
+        self.char_background.setPlainText(prof.get("background", ""))
+        self._save_character()
+
+    def _extract_characters_from_scene(self) -> None:
+        sid = self.state.viewing_scene_id
+        if not sid:
+            QMessageBox.warning(self, "안내", "먼저 추출할 장면을 선택하세요.")
+            return
+            
+        scene = self.state.project.scenes.get(sid)
+        if not scene or not scene.full_text:
+            QMessageBox.warning(self, "안내", "장면 본문이 비어 있습니다.")
+            return
+
+        client = self._build_lm_client()
+        helper = LLMCharacterHelper(client)
+        self._char_ext_worker = CharacterExtractWorker(helper, self.state.project, scene.full_text)
+        self._char_ext_worker.finished.connect(self._on_char_extract_done)
+        self._char_ext_worker.error.connect(self._on_char_extract_error)
+        self.char_extract_btn.setEnabled(False)
+        self.char_extract_btn.setText("추출 중...")
+        self._char_ext_worker.start()
+
+    def _on_char_extract_done(self, items: list) -> None:
+        self.char_extract_btn.setEnabled(True)
+        self.char_extract_btn.setText("현재 장면에서 새 인물 추출")
+        if not items:
+            QMessageBox.information(self, "추출 완료", "새롭게 등장한 비중있는 인물이 없습니다.")
+            return
+            
+        added = []
+        for item in items:
+            name = item.get("name", "").strip()
+            if not name: continue
+            
+            exists = any(p.name == name for p in self.state.project.characters.values())
+            if not exists:
+                cid = f"char_{len(self.state.project.characters) + 1}_{hash(name)%1000}"
+                cp = CharacterProfile(
+                    character_id=cid,
+                    name=name,
+                    role=item.get("role", "역할 미상"),
+                    personality=item.get("personality", ""),
+                    background=item.get("background", "")
+                )
+                self.state.project.characters[cid] = cp
+                added.append(name)
+                
+        self._refresh_char_list()
+        if added:
+            QMessageBox.information(self, "추출 완료", f"새 등장인물이 추가되었습니다:\n{', '.join(added)}")
+        else:
+            QMessageBox.information(self, "추출 완료", "새 인물이 감지되었으나 이미 등록된 인물이거나 이름이 없습니다.")
+
+    def _on_char_extract_error(self, msg: str) -> None:
+        self.char_extract_btn.setEnabled(True)
+        self.char_extract_btn.setText("현재 장면에서 새 인물 추출")
+        QMessageBox.critical(self, "추출 오류", msg)
 
     # ─── Progress UI ───
 

@@ -9,6 +9,7 @@ from .models import (
     ActType,
     BranchNode,
     CharacterState,
+    CharacterProfile,
     EndingCondition,
     FactStability,
     SceneCard,
@@ -80,6 +81,7 @@ def _project_from_dict(data: Dict[str, Any]) -> StoryProject:
         style_preset=raw["style_preset"],
         world_rules=list(raw.get("world_rules", [])),
         hard_constraints=list(raw.get("hard_constraints", [])),
+        characters={},
         acts={},
         branches={},
         scenes={},
@@ -87,6 +89,16 @@ def _project_from_dict(data: Dict[str, Any]) -> StoryProject:
         memory=memory,
     )
 
+    project.characters = {
+        k: CharacterProfile(
+            character_id=v["character_id"],
+            name=v.get("name", ""),
+            role=v.get("role", ""),
+            personality=v.get("personality", ""),
+            background=v.get("background", ""),
+        )
+        for k, v in raw.get("characters", {}).items()
+    }
     project.acts = {ActType(k) if k in [a.value for a in ActType] else ActType.RISE: list(v) for k, v in raw.get("acts", {}).items()}
     project.branches = {
         k: BranchNode(
@@ -115,6 +127,7 @@ def _project_from_dict(data: Dict[str, Any]) -> StoryProject:
             full_text=v.get("full_text"),
             reachable_endings=list(v.get("reachable_endings", [])),
             user_modified=v.get("user_modified", False),
+            context_mode=v.get("context_mode", "contiguous"),
             order_index=v.get("order_index", 0),
         )
         for k, v in raw.get("scenes", {}).items()

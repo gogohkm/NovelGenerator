@@ -181,9 +181,21 @@ class StoryEngine:
         current_branch_id: str,
         selected_option_index: int,
         target_act: Optional[ActType] = None,
+        custom_option: Optional[str] = None,
+        context_mode: str = "contiguous",
+        pov_character_id: str = "protagonist",
     ) -> SceneCard:
-        options = self.option_generator.generate_options(project, current_branch_id)
-        selected = options[selected_option_index]
+        if custom_option and custom_option.strip():
+            selected = BranchOption(
+                branch_id=f"{current_branch_id}-custom-{len(project.branches)}",
+                label="사용자 지정 전개",
+                rationale=custom_option.strip(),
+                risk="진행 방식 자유 (사용자 직접 입력)",
+                expected_ending_direction="자유형",
+            )
+        else:
+            options = self.option_generator.generate_options(project, current_branch_id)
+            selected = options[selected_option_index]
 
         if selected.branch_id not in project.branches:
             project.branches[selected.branch_id] = BranchNode(
@@ -201,10 +213,11 @@ class StoryEngine:
             scene_id=scene_id,
             act=act,
             branch_id=selected.branch_id,
-            pov_character_id="protagonist",
+            pov_character_id=pov_character_id,
             objective=selected.rationale,
             conflict=selected.risk,
             outcome=f"결말 방향 힌트: {selected.expected_ending_direction}",
+            context_mode=context_mode,
             order_index=order_index,
         )
 
